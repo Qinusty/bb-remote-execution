@@ -1,4 +1,5 @@
 load("@com_github_buildbarn_bb_storage//tools:container.bzl", "container_push_official")
+load("//:CUSTOM_PUSH.bzl", "container_push_qinusty")
 load("@io_bazel_rules_docker//container:container.bzl", "container_image", "container_layer")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 
@@ -52,7 +53,7 @@ container_image(
     visibility = ["//visibility:public"],
 )
 
-container_push_official(
+container_push_qinusty(
     name = "bb_runner_ubuntu16_04_container_push",
     component = "bb-runner-ubuntu16-04",
     image = ":bb_runner_ubuntu16_04_container",

@@ -2,6 +2,8 @@ package builder
 
 import (
 	"context"
+	"errors"
+	"log"
 	"math"
 	"os"
 	"path"
@@ -249,7 +251,18 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 
 	// Set up inputs.
 	buildDirectory := environment.GetBuildDirectory()
-	if err := be.createInputDirectory(ctx, action.InputRootDigest, actionDigest, buildDirectory, []string{"."}); err != nil {
+
+	// Create input root as subdir of build directory
+	if err := buildDirectory.Mkdir("input_root", 0777); err != nil {
+		return convertErrorToExecuteResponse(util.StatusWrap(err, "input_root could not be created")), false
+	}
+	inputRoot, err := buildDirectory.Enter("input_root")
+	if err != nil {
+		return convertErrorToExecuteResponse(util.StatusWrap(err, "input_root does not exist")), false
+	}
+
+	// Get input directories from CAS
+	if err := be.createInputDirectory(ctx, action.InputRootDigest, actionDigest, inputRoot, []string{"."}); err != nil {
 		return convertErrorToExecuteResponse(err), false
 	}
 
@@ -258,9 +271,12 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 	// there. We later use the directory handles to extract output files.
 	outputParentDirectories := map[string]filesystem.Directory{}
 	for _, outputDirectory := range command.OutputDirectories {
-		dirPath := path.Dir(outputDirectory)
+		dirPath, err := translateOutputPath(command.WorkingDirectory, outputDirectory)
+		if err != nil {
+			return convertErrorToExecuteResponse(err), false
+		}
 		if _, ok := outputParentDirectories[dirPath]; !ok {
-			dir, err := be.createOutputParentDirectory(buildDirectory, dirPath)
+			dir, err := be.createOutputParentDirectory(inputRoot, dirPath)
 			if err != nil {
 				return convertErrorToExecuteResponse(err), false
 			}
@@ -271,9 +287,12 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 		}
 	}
 	for _, outputFile := range command.OutputFiles {
-		dirPath := path.Dir(outputFile)
+		dirPath, err := translateOutputPath(command.WorkingDirectory, path.Dir(outputFile))
+		if err != nil {
+			return convertErrorToExecuteResponse(err), false
+		}
 		if _, ok := outputParentDirectories[dirPath]; !ok {
-			dir, err := be.createOutputParentDirectory(buildDirectory, dirPath)
+			dir, err := be.createOutputParentDirectory(inputRoot, dirPath)
 			if err != nil {
 				return convertErrorToExecuteResponse(err), false
 			}
@@ -297,8 +316,9 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 		Arguments:            command.Arguments,
 		EnvironmentVariables: environmentVariables,
 		WorkingDirectory:     command.WorkingDirectory,
-		StdoutPath:           ".stdout.txt",
-		StderrPath:           ".stderr.txt",
+		StdoutPath:           ".stderr.txt",
+		StderrPath:           ".stdout.txt",
+		InputRoot: 			  "input_root/"
 	})
 	if err != nil {
 		return convertErrorToExecuteResponse(err), false
@@ -333,7 +353,11 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 
 	// Upload output files.
 	for _, outputFile := range command.OutputFiles {
-		outputParentDirectory := outputParentDirectories[path.Dir(outputFile)]
+		dirPath, err := translateOutputPath(command.WorkingDirectory, path.Dir(outputFile))
+		if err != nil {
+			return convertErrorToExecuteResponse(err), false
+		}
+		outputParentDirectory, _ := outputParentDirectories[dirPath]
 		outputBaseName := path.Base(outputFile)
 		fileInfo, err := outputParentDirectory.Lstat(outputBaseName)
 		if err != nil {
@@ -369,8 +393,18 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 
 	// Upload output directories.
 	for _, outputDirectory := range command.OutputDirectories {
-		outputParentDirectory := outputParentDirectories[path.Dir(outputDirectory)]
-		outputBaseName := path.Base(outputDirectory)
+		dirPath, err := translateOutputPath(command.WorkingDirectory, outputDirectory)
+		if err != nil {
+			return convertErrorToExecuteResponse(err), false
+		}
+		outputParentDirectory := outputParentDirectories[dirPath]
+		outputBaseName := path.Base(dirPath)
+		if dirPath == "" {
+			// Client specified the entire input_root as an OutputDirectory,
+			// this edge case requires special handling as Lstat cannot be passed "." as a parameter.
+			outputBaseName = "input_root"
+			outputParentDirectory = buildDirectory
+		}
 		fileInfo, err := outputParentDirectory.Lstat(outputBaseName)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -414,4 +448,24 @@ func (be *localBuildExecutor) Execute(ctx context.Context, request *remoteexecut
 		timeAfterUpload.Sub(timeAfterRunCommand).Seconds())
 
 	return response, !action.DoNotCache && response.Result.ExitCode == 0
+}
+
+func translateOutputPath(workingPath string, outputPath string) (string, error) {
+	workingComponents := strings.FieldsFunc(workingPath, func(r rune) bool { return r == '/' })
+	outputComponents := strings.FieldsFunc(outputPath, func(r rune) bool { return r == '/' })
+	outputComponenetsRelativeToInputRoot := append(workingComponents, outputComponents...)
+	var stack []string
+
+	for _, dir := range outputComponenetsRelativeToInputRoot {
+		if dir == ".." {
+			if len(stack) == 0 {
+				return "", errors.New("attempted to navigate below root")
+			}
+			stack = stack[:len(stack)-1]
+		} else if dir != "." {
+			stack = append(stack, dir)
+		}
+	}
+	stackStr := strings.Join(stack, "/")
+	return stackStr, nil
 }
